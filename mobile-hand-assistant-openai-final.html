@@ -167,9 +167,20 @@
   const apiKeyInput = document.getElementById('apiKey');
   const modelSelect = document.getElementById('modelSelect');
 
-  // Load API key from localStorage
-  apiKeyInput.value = localStorage.getItem('openai_api_key') || '';
-  modelSelect.value = localStorage.getItem('openai_model') || 'gpt-4o-mini';
+  // Set a default API key provided by the user.  If the user has
+  // previously saved a key, it will override this default.  This
+  // prevents the app from constantly prompting for a key while still
+  // allowing the user to supply their own key via the UI.
+  const DEFAULT_API_KEY = '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';
+  const savedKey = localStorage.getItem('openai_api_key');
+  if (savedKey) {
+    apiKeyInput.value = savedKey;
+  } else {
+    apiKeyInput.value = DEFAULT_API_KEY;
+    localStorage.setItem('openai_api_key', DEFAULT_API_KEY);
+  }
+  const savedModel = localStorage.getItem('openai_model');
+  modelSelect.value = savedModel || 'gpt-4o-mini';
 
   saveKeyBtn.onclick = () => {
     localStorage.setItem('openai_api_key', apiKeyInput.value.trim());
@@ -183,11 +194,27 @@
   let mobilenetModel = null;
   let isSecure = (window.isSecureContext || location.hostname === 'localhost' || location.hostname === '127.0.0.1');
 
+  // Trail of fingertip positions.  We record points while the index finger
+  // is extended and not pinching.  For this version we no longer rely on
+  // drawing circles; instead a “point and hold” gesture is used to
+  // trigger object identification.  The fingertip must remain within
+  // a small radius for a continuous period (see HOLD_TIME_MS and
+  // MAX_MOVE_PX) for recognition to occur.  Points older than
+  // TRAIL_MS/HOLD_TIME_MS are discarded each frame.
   const trail = [];
-  const TRAIL_MS = 2000;
-  const CIRCLE_MIN_LEN = 450;
-  const CIRCLE_CLOSE_PX = 60;
-  const CIRCLE_MIN_AREA = 20000;
+  // How long (ms) to keep points in the trail; this is also the
+  // minimum hold time required before triggering recognition.
+  const HOLD_TIME_MS = 5000;
+  // Maximum movement (in pixels) allowed for a valid “point and hold”
+  // gesture.  If the fingertip moves more than twice this value in
+  // either axis within the hold window, the gesture resets.
+  const MAX_MOVE_PX = 60;
+  // We reuse TRAIL_MS as the hold window for clarity; points older
+  // than this are discarded each frame.
+  const TRAIL_MS = HOLD_TIME_MS;
+  // Timestamp of the last object announcement.  We enforce a
+  // cooldown so the user cannot accidentally trigger repeated
+  // recognitions when lingering over the same object.
   let lastObjectTime = 0;
   const OBJECT_COOLDOWN = 7000;
 
@@ -372,7 +399,7 @@
   function onResults(results) {
     ctx.clearRect(0, 0, canvas.width, canvas.height);
     if (!results.multiHandLandmarks || results.multiHandLandmarks.length === 0) {
-      // clear trail after some time
+      // When no hand is detected, age out old trail points
       const now = performance.now();
       while (trail.length && now - trail[0].t > TRAIL_MS) trail.shift();
       drawTrail();
@@ -380,41 +407,62 @@
     }
     const landmarks = results.multiHandLandmarks[0];
     drawLandmarksOnCanvas(landmarks, results.multiHandedness?.[0]?.label);
-    // index tip and thumb tip
+    // Index fingertip (8) and thumb tip (4) to detect pinching
     const indexTip = toCanvasCoords(landmarks[8]);
     const thumbTip = toCanvasCoords(landmarks[4]);
     const pinchDist = distance(indexTip, thumbTip);
     const threshold = Math.min(canvas.width, canvas.height) * 0.04;
     const isPinching = pinchDist < threshold;
-    // Add index tip to trail if not pinching
     const now = performance.now();
     if (!isPinching) {
+      // Add the current index fingertip point to the trail
       trail.push({ x: indexTip.x, y: indexTip.y, t: now });
-      // Remove old points
+      // Remove points older than the hold window
       while (trail.length && now - trail[0].t > TRAIL_MS) trail.shift();
       drawTrail();
-      // Circle detection
-      if (trail.length > 10) {
-        const length = trail.reduce((sum, pt, i) => i ? sum + distance(trail[i-1], pt) : 0, 0);
-        const start = trail[0];
-        const end = trail[trail.length - 1];
-        const bb = getBoundingBox(trail);
-        const area = bb.width * bb.height;
-        if (length > CIRCLE_MIN_LEN && distance(start, end) < CIRCLE_CLOSE_PX && area > CIRCLE_MIN_AREA) {
-          // Circle gesture detected
-          log('Circle gesture detected.');
-          trail.length = 0;
-          identifyObject(bb);
+      // Check if the fingertip has been held steady long enough to trigger recognition
+      if (trail.length > 5) {
+        const bbTrail = getBoundingBox(trail);
+        const duration = now - trail[0].t;
+        // The fingertip must remain within a MAX_MOVE_PX radius in both dimensions
+        if (bbTrail.width <= MAX_MOVE_PX * 2 && bbTrail.height <= MAX_MOVE_PX * 2 && duration >= HOLD_TIME_MS) {
+          // Only classify if cooldown has passed
+          if (Date.now() - lastObjectTime >= OBJECT_COOLDOWN) {
+            lastObjectTime = Date.now();
+            log('Hold gesture detected. Classifying object...');
+            // Enlarge the bounding box around the held point to capture the surrounding object
+            const enlarge = 200;
+            // Center of the held region
+            const cx = bbTrail.x + bbTrail.width / 2;
+            const cy = bbTrail.y + bbTrail.height / 2;
+            const w = Math.max(enlarge, bbTrail.width);
+            const h = Math.max(enlarge, bbTrail.height);
+            let x = cx - w / 2;
+            let y = cy - h / 2;
+            // Clamp to canvas boundaries
+            if (x < 0) x = 0;
+            if (y < 0) y = 0;
+            if (x + w > canvas.width) x = canvas.width - w;
+            if (y + h > canvas.height) y = canvas.height - h;
+            // Trigger object identification
+            identifyObject({ x, y, width: w, height: h });
+            // Reset the trail after classification
+            trail.length = 0;
+          }
         }
       }
     } else {
-      // If pinching, clear trail (we treat pinch as no circle)
+      // If pinching, clear the trail; a pinch is considered an intentional interrupt
       trail.length = 0;
       drawTrail();
     }
   }
 
   function drawTrail() {
+    // Draw the fingertip path to give the user feedback on where
+    // they have moved their finger.  We only draw when there are
+    // multiple points; very short trails are ignored to reduce
+    // flicker.
     if (trail.length < 2) return;
     ctx.strokeStyle = '#5ab0ff';
     ctx.lineWidth = 4;
