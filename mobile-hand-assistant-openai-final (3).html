@@ -1,0 +1,552 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Mobile Hand Assistant</title>
+  <style>
+    :root {
+      --bg: #0b0f14;
+      --panel: #121821;
+      --text: #eaf2ff;
+      --muted: #8aa1b8;
+      --accent: #5ab0ff;
+      --warn: #ffb677;
+      --err: #ff6b6b;
+    }
+    * {
+      box-sizing: border-box;
+    }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font-family: Inter, system-ui, Segoe UI, Roboto, Helvetica, Arial, sans-serif;
+      -webkit-font-smoothing: antialiased;
+    }
+    header {
+      padding: 10px 14px;
+      background: var(--panel);
+      border-bottom: 1px solid #1c2531;
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+    }
+    h1 {
+      font-size: 18px;
+      margin: 0;
+    }
+    main {
+      padding: 10px 14px;
+    }
+    .controls {
+      margin-bottom: 12px;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+    .controls > * {
+      background: var(--panel);
+      border: 1px solid #1f2a3a;
+      color: var(--text);
+      border-radius: 8px;
+      padding: 6px 10px;
+      font-size: 14px;
+    }
+    .controls button,
+    .controls select,
+    .controls input[type="text"] {
+      cursor: pointer;
+    }
+    .board {
+      position: relative;
+      width: 100%;
+      height: 60vh;
+      background: #000;
+      border-radius: 12px;
+      overflow: hidden;
+    }
+    video {
+      position: absolute;
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+      z-index: 1;
+    }
+    canvas {
+      position: absolute;
+      width: 100%;
+      height: 100%;
+      z-index: 2;
+      pointer-events: none;
+    }
+    .status {
+      margin-top: 8px;
+      font-size: 14px;
+      color: var(--muted);
+    }
+    .logs {
+      background: var(--panel);
+      padding: 10px;
+      border: 1px solid #1f2a3a;
+      border-radius: 8px;
+      margin-top: 10px;
+      max-height: 25vh;
+      overflow-y: auto;
+      font-size: 13px;
+      white-space: pre-wrap;
+    }
+    .btn {
+      background: #0f1824;
+      border-color: #2a374a;
+      padding: 8px 12px;
+      border-radius: 8px;
+      color: var(--text);
+      cursor: pointer;
+      transition: 0.15s ease;
+    }
+    .btn:hover {
+      background: #1a2538;
+    }
+    .small {
+      font-size: 12px;
+    }
+  </style>
+  <!-- Load MediaPipe Hands -->
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js"></script>
+  <!-- Load TensorFlow.js and MobileNet -->
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@3.21.0/dist/tf.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/mobilenet@2.1.0/dist/mobilenet.min.js"></script>
+  <!-- Load Tesseract.js for OCR -->
+  <script src="https://cdn.jsdelivr.net/npm/tesseract.js@2.1.4/dist/tesseract.min.js"></script>
+</head>
+<body>
+  <header>
+    <h1>📱 Mobile Hand Assistant</h1>
+    <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+      <input type="text" id="apiKey" placeholder="OpenAI API Key (sk-...)" style="flex:1;min-width:200px" />
+      <select id="modelSelect" style="min-width:120px">
+        <option value="gpt-3.5-turbo">gpt-3.5-turbo</option>
+        <option value="gpt-4o">gpt-4o</option>
+        <option value="gpt-4o-mini" selected>gpt-4o-mini</option>
+      </select>
+      <button class="btn" id="saveKey">Save</button>
+    </div>
+  </header>
+  <main>
+    <div class="controls">
+      <button class="btn" id="startCam">Start Camera</button>
+      <button class="btn" id="stopCam">Stop Camera</button>
+      <button class="btn" id="startMic">Start Microphone</button>
+      <button class="btn" id="stopMic">Stop Microphone</button>
+      <button class="btn" id="clearTrail">Clear Trail</button>
+    </div>
+    <div class="board">
+      <video id="video" playsinline muted></video>
+      <canvas id="overlay"></canvas>
+    </div>
+    <div class="status" id="status">Idle. Please start the camera.</div>
+    <div class="logs" id="logs">Logs will appear here...</div>
+  </main>
+<script>
+(() => {
+  const statusEl = document.getElementById('status');
+  const logsEl = document.getElementById('logs');
+  const video = document.getElementById('video');
+  const canvas = document.getElementById('overlay');
+  const ctx = canvas.getContext('2d');
+  const startCamBtn = document.getElementById('startCam');
+  const stopCamBtn = document.getElementById('stopCam');
+  const startMicBtn = document.getElementById('startMic');
+  const stopMicBtn = document.getElementById('stopMic');
+  const clearTrailBtn = document.getElementById('clearTrail');
+  const saveKeyBtn = document.getElementById('saveKey');
+  const apiKeyInput = document.getElementById('apiKey');
+  const modelSelect = document.getElementById('modelSelect');
+
+  // Set a default API key provided by the user.  If the user has
+  // previously saved a key, it will override this default.  This
+  // prevents the app from constantly prompting for a key while still
+  // allowing the user to supply their own key via the UI.
+  const DEFAULT_API_KEY = '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';
+  const savedKey = localStorage.getItem('openai_api_key');
+  if (savedKey) {
+    apiKeyInput.value = savedKey;
+  } else {
+    apiKeyInput.value = DEFAULT_API_KEY;
+    localStorage.setItem('openai_api_key', DEFAULT_API_KEY);
+  }
+  const savedModel = localStorage.getItem('openai_model');
+  modelSelect.value = savedModel || 'gpt-4o-mini';
+
+  saveKeyBtn.onclick = () => {
+    localStorage.setItem('openai_api_key', apiKeyInput.value.trim());
+    localStorage.setItem('openai_model', modelSelect.value);
+    log('API key and model saved.');
+  };
+
+  let cameraStream = null;
+  let hands = null;
+  let running = false;
+  let mobilenetModel = null;
+  let isSecure = (window.isSecureContext || location.hostname === 'localhost' || location.hostname === '127.0.0.1');
+
+  // Trail of fingertip positions.  We record points while the index finger
+  // is extended and not pinching.  For this version we no longer rely on
+  // drawing circles; instead a “point and hold” gesture is used to
+  // trigger object identification.  The fingertip must remain within
+  // a small radius for a continuous period (see HOLD_TIME_MS and
+  // MAX_MOVE_PX) for recognition to occur.  Points older than
+  // TRAIL_MS/HOLD_TIME_MS are discarded each frame.
+  const trail = [];
+  // How long (ms) to keep points in the trail; this is also the
+  // minimum hold time required before triggering recognition.
+  // Require a slightly shorter hold to trigger recognition.  Four seconds
+  // of minimal finger movement should be enough for most users.
+  const HOLD_TIME_MS = 4000;
+  // Maximum movement (in pixels) allowed for a valid “point and hold”
+  // gesture.  If the fingertip moves more than twice this value in
+  // either axis within the hold window, the gesture resets.
+  // Allow a bit more finger drift while holding so the gesture isn't too
+  // strict.  Eighty pixels (~0.8cm at 96 dpi) provides a good balance
+  // between intentional holds and accidental movement.
+  const MAX_MOVE_PX = 80;
+  // We reuse TRAIL_MS as the hold window for clarity; points older
+  // than this are discarded each frame.
+  const TRAIL_MS = HOLD_TIME_MS;
+  // Timestamp of the last object announcement.  We enforce a
+  // cooldown so the user cannot accidentally trigger repeated
+  // recognitions when lingering over the same object.
+  let lastObjectTime = 0;
+  const OBJECT_COOLDOWN = 7000;
+
+  // Logging helper
+  function log(msg) {
+    const now = new Date().toLocaleTimeString();
+    logsEl.textContent = `[${now}] ${msg}\n` + logsEl.textContent;
+  }
+
+  // Resize canvas to match video
+  function resizeCanvas() {
+    const rect = video.getBoundingClientRect();
+    canvas.width = rect.width;
+    canvas.height = rect.height;
+  }
+
+  window.addEventListener('resize', resizeCanvas);
+
+  // Initialize MediaPipe Hands
+  function initHands() {
+    hands = new Hands({ locateFile: file => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}` });
+    hands.setOptions({
+      maxNumHands: 1,
+      modelComplexity: 1,
+      selfieMode: false,
+      minDetectionConfidence: 0.6,
+      minTrackingConfidence: 0.6
+    });
+    hands.onResults(onResults);
+  }
+
+  // Frame processing
+  async function loop() {
+    if (!running) return;
+    try {
+      await hands.send({ image: video });
+    } catch (e) {
+      // ignore frame errors
+    }
+    requestAnimationFrame(loop);
+  }
+
+  function drawLandmarksOnCanvas(landmarks, handedness) {
+    drawConnectors(ctx, landmarks, HAND_CONNECTIONS, { color: '#00FFAA', lineWidth: 2 });
+    drawLandmarks(ctx, landmarks, { color: '#FFAA00', lineWidth: 1, radius: 3 });
+  }
+
+  function toCanvasCoords(norm) {
+    // no mirroring: x = norm.x * width
+    return { x: norm.x * canvas.width, y: norm.y * canvas.height };
+  }
+
+  function distance(a, b) {
+    const dx = a.x - b.x;
+    const dy = a.y - b.y;
+    return Math.hypot(dx, dy);
+  }
+
+  function getBoundingBox(points) {
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    points.forEach(p => {
+      minX = Math.min(minX, p.x);
+      minY = Math.min(minY, p.y);
+      maxX = Math.max(maxX, p.x);
+      maxY = Math.max(maxY, p.y);
+    });
+    return { x: minX, y: minY, width: maxX - minX, height: maxY - minY };
+  }
+
+  async function classifyCrop(bb) {
+    if (!mobilenetModel) {
+      log('Loading MobileNet...');
+      mobilenetModel = await mobilenet.load({ version: 2, alpha: 0.75 });
+    }
+    // Capture the crop from video
+    const offscreen = document.createElement('canvas');
+    offscreen.width = bb.width;
+    offscreen.height = bb.height;
+    const octx = offscreen.getContext('2d');
+    octx.drawImage(video, bb.x / canvas.width * video.videoWidth, bb.y / canvas.height * video.videoHeight, bb.width / canvas.width * video.videoWidth, bb.height / canvas.height * video.videoHeight, 0, 0, bb.width, bb.height);
+    const tensor = tf.browser.fromPixels(offscreen);
+    const resized = tf.image.resizeBilinear(tensor, [224, 224]);
+    const expanded = resized.expandDims(0);
+    const preds = await mobilenetModel.classify(expanded);
+    tensor.dispose(); resized.dispose(); expanded.dispose();
+    return preds;
+  }
+
+  async function identifyObject(bb) {
+    if (Date.now() - lastObjectTime < OBJECT_COOLDOWN) return;
+    lastObjectTime = Date.now();
+    log('Classifying object...');
+    const preds = await classifyCrop(bb);
+    const top = preds && preds[0];
+    const label = top ? top.className : 'object';
+    const prob = top ? (top.probability * 100).toFixed(1) : 'unknown';
+    log(`Object: ${label} (${prob}%)`);
+    await speak(`I see ${label}. Do you have any questions about it?`);
+    // Ask OpenAI to describe it and ask if user has questions
+    const system = 'You are a helpful assistant that describes objects succinctly and can answer follow-up questions.';
+    const userPrompt = `Describe the object ${label} in a short sentence. Then ask: Do you have any questions about it?`;
+    const answer = await callOpenAI(system, userPrompt);
+    if (answer) log('AI: ' + answer);
+    if (answer) await speak(answer);
+    listenForFollowup(label);
+  }
+
+  function listenForFollowup(context) {
+    // Start speech recognition to capture user's question
+    if (!('webkitSpeechRecognition' in window) && !('SpeechRecognition' in window)) {
+      log('Speech Recognition API not supported in this browser.');
+      return;
+    }
+    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+    const recognizer = new SpeechRecognition();
+    recognizer.lang = 'en-US';
+    recognizer.continuous = false;
+    recognizer.interimResults = false;
+    log('Listening for user question...');
+    recognizer.start();
+    recognizer.onresult = async evt => {
+      const text = evt.results[0][0].transcript;
+      log('User asked: ' + text);
+      // Compose prompt for OpenAI
+      const system = 'You are a knowledgeable assistant answering questions about objects the user identifies.';
+      const userPrompt = `The user asked about ${context}. Question: ${text}`;
+      const answer = await callOpenAI(system, userPrompt);
+      if (answer) log('AI: ' + answer);
+      if (answer) await speak(answer);
+    };
+    recognizer.onerror = (e) => {
+      log('Speech recognition error: ' + e.error);
+    };
+  }
+
+  async function callOpenAI(systemPrompt, userPrompt) {
+    const key = apiKeyInput.value.trim();
+    if (!key) {
+      log('No API key. Please enter and save your OpenAI API key.');
+      return null;
+    }
+    const model = modelSelect.value;
+    try {
+      const resp = await fetch('https://api.openai.com/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${key}`
+        },
+        body: JSON.stringify({
+          model: model,
+          temperature: 0.3,
+          messages: [
+            { role: 'system', content: systemPrompt },
+            { role: 'user', content: userPrompt }
+          ]
+        })
+      });
+      if (!resp.ok) {
+        const err = await resp.json().catch(() => ({}));
+        log('OpenAI error: ' + (err.error && err.error.message ? err.error.message : resp.statusText));
+        return null;
+      }
+      const data = await resp.json();
+      const answer = data.choices[0].message.content.trim();
+      return answer;
+    } catch (e) {
+      log('Error calling OpenAI: ' + e.message);
+      return null;
+    }
+  }
+
+  async function speak(text) {
+    return new Promise(resolve => {
+      const utter = new SpeechSynthesisUtterance(text);
+      utter.onend = resolve;
+      utter.onerror = resolve;
+      window.speechSynthesis.speak(utter);
+    });
+  }
+
+  function onResults(results) {
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    if (!results.multiHandLandmarks || results.multiHandLandmarks.length === 0) {
+      // When no hand is detected, age out old trail points
+      const now = performance.now();
+      while (trail.length && now - trail[0].t > TRAIL_MS) trail.shift();
+      drawTrail();
+      return;
+    }
+    const landmarks = results.multiHandLandmarks[0];
+    drawLandmarksOnCanvas(landmarks, results.multiHandedness?.[0]?.label);
+    // Index fingertip (8) and thumb tip (4) to detect pinching
+    const indexTip = toCanvasCoords(landmarks[8]);
+    const thumbTip = toCanvasCoords(landmarks[4]);
+    const pinchDist = distance(indexTip, thumbTip);
+    const threshold = Math.min(canvas.width, canvas.height) * 0.04;
+    const isPinching = pinchDist < threshold;
+    const now = performance.now();
+    if (!isPinching) {
+      // Add the current index fingertip point to the trail
+      trail.push({ x: indexTip.x, y: indexTip.y, t: now });
+      // Remove points older than the hold window
+      while (trail.length && now - trail[0].t > TRAIL_MS) trail.shift();
+      drawTrail();
+      // Check if the fingertip has been held steady long enough to trigger recognition
+      if (trail.length > 5) {
+        const bbTrail = getBoundingBox(trail);
+        const duration = now - trail[0].t;
+        // The fingertip must remain within a MAX_MOVE_PX radius in both dimensions
+        if (bbTrail.width <= MAX_MOVE_PX * 2 && bbTrail.height <= MAX_MOVE_PX * 2 && duration >= HOLD_TIME_MS) {
+          // Only classify if cooldown has passed
+          if (Date.now() - lastObjectTime >= OBJECT_COOLDOWN) {
+            lastObjectTime = Date.now();
+            log('Hold gesture detected. Classifying object...');
+            // Enlarge the bounding box around the held point to capture the surrounding object
+            const enlarge = 200;
+            // Center of the held region
+            const cx = bbTrail.x + bbTrail.width / 2;
+            const cy = bbTrail.y + bbTrail.height / 2;
+            const w = Math.max(enlarge, bbTrail.width);
+            const h = Math.max(enlarge, bbTrail.height);
+            let x = cx - w / 2;
+            let y = cy - h / 2;
+            // Clamp to canvas boundaries
+            if (x < 0) x = 0;
+            if (y < 0) y = 0;
+            if (x + w > canvas.width) x = canvas.width - w;
+            if (y + h > canvas.height) y = canvas.height - h;
+            // Trigger object identification
+            identifyObject({ x, y, width: w, height: h });
+            // Reset the trail after classification
+            trail.length = 0;
+          }
+        }
+      }
+    } else {
+      // If pinching, clear the trail; a pinch is considered an intentional interrupt
+      trail.length = 0;
+      drawTrail();
+    }
+  }
+
+  function drawTrail() {
+    // Draw the fingertip path to give the user feedback on where
+    // they have moved their finger.  We only draw when there are
+    // multiple points; very short trails are ignored to reduce
+    // flicker.
+    if (trail.length < 2) return;
+    ctx.strokeStyle = '#5ab0ff';
+    ctx.lineWidth = 4;
+    ctx.beginPath();
+    ctx.moveTo(trail[0].x, trail[0].y);
+    for (let i = 1; i < trail.length; i++) {
+      ctx.lineTo(trail[i].x, trail[i].y);
+    }
+    ctx.stroke();
+  }
+
+  startCamBtn.onclick = async () => {
+    if (!isSecure) {
+      statusEl.textContent = 'Camera requires HTTPS or localhost.';
+      return;
+    }
+    if (cameraStream) {
+      log('Camera already running.');
+      return;
+    }
+    try {
+      cameraStream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' }, audio: false });
+      video.srcObject = cameraStream;
+      await video.play();
+      resizeCanvas();
+      initHands();
+      running = true;
+      statusEl.textContent = 'Camera running. Showing hand tracking.';
+      loop();
+    } catch (err) {
+      statusEl.textContent = 'Failed to start camera: ' + err.message;
+      log('Camera error: ' + err.message);
+    }
+  };
+
+  stopCamBtn.onclick = () => {
+    running = false;
+    if (cameraStream) {
+      cameraStream.getTracks().forEach(track => track.stop());
+      cameraStream = null;
+    }
+    statusEl.textContent = 'Camera stopped.';
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    log('Camera stopped.');
+  };
+
+  startMicBtn.onclick = () => {
+    // Request permission only; recognition triggered later.
+    if (!('webkitSpeechRecognition' in window) && !('SpeechRecognition' in window)) {
+      log('Speech Recognition API not supported in this browser.');
+      return;
+    }
+    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+    const recognizer = new SpeechRecognition();
+    recognizer.lang = 'en-US';
+    recognizer.interimResults = false;
+    recognizer.continuous = false;
+    // Request permission by starting and immediately stopping
+    recognizer.start();
+    recognizer.onstart = () => {
+      log('Microphone permission granted.');
+      recognizer.stop();
+    };
+    recognizer.onerror = e => {
+      log('Microphone error: ' + e.error);
+    };
+  };
+
+  stopMicBtn.onclick = () => {
+    // Nothing to do; recognition sessions are one-time. Provide message for user.
+    log('Microphone use will stop automatically after each recognition session.');
+  };
+
+  clearTrailBtn.onclick = () => {
+    trail.length = 0;
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    log('Trail cleared.');
+  };
+})();
+</script>
+</body>
+</html>
