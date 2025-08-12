@@ -1,0 +1,409 @@
+<!--
+mobile_hand_assistant.html
+-------------------------
+
+This standalone web page implements a mobile hand assistant. When opened
+in a modern browser (desktop or mobile), it accesses the device’s camera,
+detects objects and faces in real time, draws circles around them and
+tracks the user’s hand so that hovering a finger over an object triggers
+a call to OpenAI’s vision API to generate a descriptive label. The API
+key is embedded in the script to make the page self‑contained.
+
+Libraries used:
+  * MediaPipe Hands and Face Detection for hand and head tracking.
+  * TensorFlow.js and the COCO‑SSD model for generic object detection.
+  * OpenAI API via fetch for vision‑language description.
+
+To run the page, simply open it in a browser that supports
+`MediaDevices.getUserMedia()` and `async/await`. No server is required.
+-->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Mobile Hand Assistant</title>
+  <style>
+    body {
+      margin: 0;
+      font-family: Arial, sans-serif;
+      background-color: #111;
+      color: #eee;
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+    }
+    #controls {
+      margin: 10px;
+    }
+    button {
+      margin: 2px;
+      padding: 6px 12px;
+      background-color: #333;
+      color: #fff;
+      border: none;
+      border-radius: 4px;
+      cursor: pointer;
+    }
+    button:hover {
+      background-color: #555;
+    }
+    #canvas {
+      position: relative;
+      width: 100%;
+      height: auto;
+      max-width: 640px;
+    }
+    #log {
+      width: 100%;
+      max-width: 640px;
+      height: 100px;
+      background-color: #222;
+      overflow-y: auto;
+      font-size: 12px;
+      padding: 4px;
+      box-sizing: border-box;
+      margin-top: 8px;
+    }
+    #log p {
+      margin: 2px 0;
+    }
+  </style>
+</head>
+<body>
+  <h2>Mobile Hand Assistant</h2>
+  <div id="controls">
+    <button id="startBtn">Start</button>
+    <button id="stopBtn" disabled>Stop</button>
+  </div>
+  <video id="video" style="display:none;" playsinline></video>
+  <canvas id="canvas"></canvas>
+  <div id="log"></div>
+
+  <!-- External libraries via CDN -->
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/face_detection/face_detection.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@3.20.0/dist/tf.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd"></script>
+
+  <script>
+  // Configuration: OpenAI API key and model. The key is embedded here for
+  // convenience; treat it as sensitive and avoid sharing this file in public
+  // repositories.
+  const OPENAI_API_KEY = "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";
+  const OPENAI_MODEL = "gpt-4o";
+
+  // DOM elements
+  const startBtn = document.getElementById('startBtn');
+  const stopBtn = document.getElementById('stopBtn');
+  const video = document.getElementById('video');
+  const canvas = document.getElementById('canvas');
+  const ctx = canvas.getContext('2d');
+  const logEl = document.getElementById('log');
+
+  // State variables
+  let camera = null;
+  let running = false;
+  let cocoModel = null;
+  let hands = null;
+  let faceDetection = null;
+  let currentObjects = [];
+  let currentFaces = [];
+  let currentHandLandmarks = [];
+  const labelsCache = new Map(); // Map from object id to descriptive label
+  let detectionTimer = null; // interval timer for object detection
+
+  // Prepare TensorFlow.js backend for faster object detection. When using
+  // WebGL, operations run on the GPU which improves performance on most
+  // devices. We call tf.ready() to ensure the library is initialised
+  // properly before usage.
+  (async () => {
+    try {
+      await tf.ready();
+      await tf.setBackend('webgl');
+      log('TensorFlow.js backend set to WebGL');
+    } catch (err) {
+      log('Could not set TensorFlow backend: ' + err.message);
+    }
+  })();
+
+  // Utility: log messages to the log area
+  function log(msg) {
+    const p = document.createElement('p');
+    p.textContent = msg;
+    logEl.appendChild(p);
+    logEl.scrollTop = logEl.scrollHeight;
+  }
+
+  // Initialize MediaPipe Hands
+  async function initHands() {
+    hands = new Hands({
+      locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`,
+    });
+    hands.setOptions({
+      maxNumHands: 1,
+      modelComplexity: 1,
+      minDetectionConfidence: 0.5,
+      minTrackingConfidence: 0.5,
+    });
+    hands.onResults((results) => {
+      currentHandLandmarks = results.multiHandLandmarks || [];
+    });
+  }
+
+  // Initialize MediaPipe Face Detection
+  async function initFaceDetection() {
+    faceDetection = new FaceDetection({
+      locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/face_detection/${file}`,
+    });
+    faceDetection.setOptions({
+      model: 'short',
+      maxNumFaces: 5,
+      minDetectionConfidence: 0.5,
+    });
+    faceDetection.onResults((results) => {
+      currentFaces = results.detections || [];
+    });
+  }
+
+  // Initialize COCO‑SSD model
+  async function initCoco() {
+    cocoModel = await cocoSsd.load();
+    log('COCO‑SSD model loaded');
+  }
+
+  // Convert a region of the current frame to a base64 encoded PNG
+  function cropToBase64(x, y, w, h) {
+    const offscreen = document.createElement('canvas');
+    offscreen.width = w;
+    offscreen.height = h;
+    const offCtx = offscreen.getContext('2d');
+    offCtx.drawImage(canvas, x, y, w, h, 0, 0, w, h);
+    return offscreen.toDataURL('image/png');
+  }
+
+  // Request a description from OpenAI for a cropped image
+  async function fetchOpenAiDescription(base64Image) {
+    try {
+      const payload = {
+        model: OPENAI_MODEL,
+        messages: [
+          {
+            role: 'user',
+            content: [
+              { type: 'text', text: 'Describe the main object in this image succinctly.' },
+              { type: 'image_url', image_url: base64Image },
+            ],
+          },
+        ],
+        max_tokens: 20,
+      };
+      const response = await fetch('https://api.openai.com/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': 'Bearer ' + OPENAI_API_KEY,
+        },
+        body: JSON.stringify(payload),
+      });
+      if (!response.ok) {
+        log('OpenAI API error: ' + response.statusText);
+        return '';
+      }
+      const data = await response.json();
+      const content = data.choices[0].message.content.trim();
+      return content;
+    } catch (err) {
+      log('OpenAI request failed: ' + err.message);
+      return '';
+    }
+  }
+
+  // Check if a point is inside a circle
+  function pointInCircle(px, py, cx, cy, radius) {
+    const dx = px - cx;
+    const dy = py - cy;
+    return dx * dx + dy * dy <= radius * radius;
+  }
+
+  // Main drawing loop
+  function drawLoop() {
+    if (!running) return;
+    if (video.readyState >= 2) {
+      canvas.width = video.videoWidth;
+      canvas.height = video.videoHeight;
+      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+      // Draw hands landmarks
+      if (currentHandLandmarks.length > 0) {
+        const hand = currentHandLandmarks[0];
+        drawConnectors(ctx, hand, Hands.HAND_CONNECTIONS, { color: '#00C49A', lineWidth: 3 });
+        drawLandmarks(ctx, hand, { color: '#FFB74D', lineWidth: 2 });
+      }
+      // Draw face circles
+      currentFaces.forEach((det) => {
+        const bbox = det.locationData.relativeBoundingBox;
+        const cx = bbox.xCenter * canvas.width;
+        const cy = bbox.yCenter * canvas.height;
+        const radius = Math.max(bbox.width, bbox.height) * 0.5 * Math.min(canvas.width, canvas.height);
+        ctx.beginPath();
+        ctx.lineWidth = 4;
+        ctx.strokeStyle = '#00AAFF';
+        ctx.arc(cx, cy, radius, 0, 2 * Math.PI);
+        ctx.stroke();
+      });
+      // Determine fingertip position
+      let fingerX = null;
+      let fingerY = null;
+      if (currentHandLandmarks.length > 0) {
+        const tip = currentHandLandmarks[0][8];
+        fingerX = tip.x * canvas.width;
+        fingerY = tip.y * canvas.height;
+      }
+      // Draw object circles and handle hover
+      currentObjects.forEach((obj, i) => {
+        const [x, y, w, h] = obj.bbox;
+        if (obj.class === 'person') return;
+        const cx = x + w / 2;
+        const cy = y + h / 2;
+        const radius = Math.max(w, h) * 0.6;
+        ctx.beginPath();
+        ctx.lineWidth = 3;
+        ctx.strokeStyle = '#AAFF00';
+        ctx.arc(cx, cy, radius, 0, 2 * Math.PI);
+        ctx.stroke();
+        // Hover detection
+        if (fingerX !== null && fingerY !== null && pointInCircle(fingerX, fingerY, cx, cy, radius)) {
+          const id = obj.id || i;
+          if (!labelsCache.has(id)) {
+            labelsCache.set(id, '...');
+            const cropW = Math.min(w, canvas.width - x);
+            const cropH = Math.min(h, canvas.height - y);
+            const base64 = cropToBase64(Math.max(0, x), Math.max(0, y), cropW, cropH);
+            fetchOpenAiDescription(base64).then((text) => {
+              labelsCache.set(id, text || obj.class);
+              log('Label for ' + obj.class + ': ' + text);
+              drawOverlayLabels();
+            });
+          }
+        }
+      });
+      // Draw overlay labels
+      drawOverlayLabels();
+    }
+    requestAnimationFrame(drawLoop);
+  }
+
+  // Draw labels near objects using cached descriptions
+  function drawOverlayLabels() {
+    // Clear overlay layer (we simply re-draw labels on the main canvas)
+    currentObjects.forEach((obj, i) => {
+      const id = obj.id || i;
+      const label = labelsCache.get(id);
+      if (!label || label === '...') return;
+      const [x, y, w, h] = obj.bbox;
+      const cx = x + w / 2;
+      const cy = y + h / 2;
+      ctx.font = '16px sans-serif';
+      ctx.fillStyle = '#FFFFFF';
+      ctx.strokeStyle = '#000000';
+      ctx.lineWidth = 4;
+      const text = label;
+      const metrics = ctx.measureText(text);
+      const textX = cx - metrics.width / 2;
+      const textY = cy - (Math.max(w, h) * 0.6) - 10;
+      ctx.strokeText(text, textX, textY);
+      ctx.fillText(text, textX, textY);
+    });
+  }
+
+  // Run object detection at a fixed interval to reduce lag
+  async function runObjectDetection() {
+    if (!running || !cocoModel) return;
+    try {
+      const predictions = await cocoModel.detect(video);
+      currentObjects = predictions.map((p, idx) => {
+        return {
+          id: idx,
+          class: p.class,
+          score: p.score,
+          bbox: [p.bbox[0], p.bbox[1], p.bbox[2], p.bbox[3]],
+        };
+      });
+    } catch (err) {
+      log('Detection error: ' + err.message);
+    }
+  }
+
+  // Start the camera and processing loops
+  async function start() {
+    if (running) return;
+    running = true;
+    startBtn.disabled = true;
+    stopBtn.disabled = false;
+    // Initialize models if not already
+    if (!hands) await initHands();
+    if (!faceDetection) await initFaceDetection();
+    if (!cocoModel) await initCoco();
+    // Setup camera
+    const constraints = { video: { facingMode: 'environment' }, audio: false };
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia(constraints);
+      video.srcObject = stream;
+      await video.play();
+      // Use MediaPipe's Camera helper to process frames for hands and face
+      camera = new Camera(video, {
+        onFrame: async () => {
+          if (!running) return;
+          try {
+            await hands.send({ image: video });
+            await faceDetection.send({ image: video });
+          } catch (err) {
+            // ignore errors
+          }
+        },
+        width: 640,
+        height: 480,
+      });
+      camera.start();
+      // Start drawing loop
+      requestAnimationFrame(drawLoop);
+      // Start periodic object detection
+      if (detectionTimer) clearInterval(detectionTimer);
+      detectionTimer = setInterval(runObjectDetection, 700); // run every 0.7 seconds
+      log('Camera started');
+    } catch (err) {
+      log('Could not access camera: ' + err.message);
+      running = false;
+      startBtn.disabled = false;
+      stopBtn.disabled = true;
+    }
+  }
+
+  // Stop the camera and loops
+  function stop() {
+    running = false;
+    startBtn.disabled = false;
+    stopBtn.disabled = true;
+    if (video.srcObject) {
+      video.srcObject.getTracks().forEach(track => track.stop());
+      video.srcObject = null;
+    }
+    if (camera) {
+      camera.stop();
+    }
+    if (detectionTimer) {
+      clearInterval(detectionTimer);
+      detectionTimer = null;
+    }
+    log('Camera stopped');
+  }
+
+  // Attach event listeners
+  startBtn.addEventListener('click', start);
+  stopBtn.addEventListener('click', stop);
+  </script>
+</body>
+</html>
